@@ -9,7 +9,7 @@ import threading
 import time
 import shutil
 import glob
-
+from datetime import datetime
 from fuse import FUSE, FuseOSError, Operations, fuse_get_context
 
 
@@ -128,14 +128,19 @@ class Passthrough(Operations):
         return self.flush(path, fh)
 
 class CachedPassthrough(Passthrough):
-    def __init__(self, root, fallbackRoot):
+    def __init__(self, root, fallbackRoot, cacheSize):
         super().__init__(root)
         self.root = root
+        self.cacheSize = cacheSize
         self.fallbackRoot = fallbackRoot
         self.backgroundWorker = threading.Thread(target = self.sync_to_fallback)
         self.backgroundWorker.deamon = True
         self.backgroundWorker.start()
+        self.backgroundCleaner = threading.Thread(target = self.clean_cache)
+        self.backgroundCleaner.daemon = True
+        self.backgroundCleaner.start()
         self.lastSync = 0
+        self.nosync = []
     
     def _full_path_gen(self, root, partial):
         if partial.startswith("/"):
@@ -164,6 +169,7 @@ class CachedPassthrough(Passthrough):
             fallbackPath = self._full_path_gen(self.fallbackRoot, path)
             if not os.path.exists(full_path):
                 shutil.copyfile(fallbackPath, full_path)
+                self.nosync.append(full_path)
         return super().open(path, flags)
 
     def getattr(self, path, fh=None):
@@ -177,26 +183,48 @@ class CachedPassthrough(Passthrough):
                 'st_gid', 'st_mode', 'st_mtime', 'st_nlink', 'st_size', 'st_uid'))
 
     def sync_to_fallback(self):
-        # Initial timeout
-        #time.sleep(5)
         while True:
-            time.sleep(1)
+            time.sleep(30)
+            print(self.nosync)
             list_of_files = glob.glob(self.root + "/*") # * means all if need specific format then *.csv
             for file in list_of_files:
-                if os.path.getctime(file) > self.lastSync:
+                if os.path.getctime(file) > self.lastSync and file not in self.nosync:
                     file_stripped_path = file[len(self.root):]
                     fallbackPath = self._full_path_gen(self.fallbackRoot, file_stripped_path)
                     if not os.path.exists(fallbackPath) or os.path.getctime(file) > os.path.getctime(fallbackPath):
-                        if os.path.exists(fallbackPath):
-                            os.remove(fallbackPath)
-                        shutil.copyfile(file, fallbackPath)
-                        print("file synced: " + file_stripped_path)
-                        time.sleep(1)
-            
+                        if os.path.isfile(file):
+                            if os.path.exists(fallbackPath):
+                                os.remove(fallbackPath)
+                            shutil.copyfile(file, fallbackPath)
+                            print("file synced: " + file_stripped_path)
+                            time.sleep(3)
+                        else:
+                            print("is directory")
+            self.nosync = []
+            self.lastSync = datetime.now().timestamp()
+    
+    def clean_cache(self):
+        # Initial timeout, makes sure both threads don't run at the same time to keep load balanced
+        time.sleep(20)
+        print("cache size: " + str(self.cacheSize)) 
+        while True:
+            time.sleep(30)
+            size = 0
+            list_of_files = glob.glob(self.root + "/*")
+            for ele in list_of_files:
+                size+=os.path.getsize(ele)
+            if (size > (self.cacheSize * 0.9)):
+                oldestFile = min(list_of_files, key = os.path.getatime)
+                if os.path.isfile(oldestFile):
+                    os.remove(oldestFile)
+                else:
+                    shutil.rmtree(oldestFile)
+                print("cleaned file: " + str(oldestFile))
+
             
 
 def main(mountpoint, root, fallbackRoot):
-    FUSE(CachedPassthrough(root, fallbackRoot), mountpoint, nothreads=False, foreground=True, allow_other=True)
+    FUSE(CachedPassthrough(root, fallbackRoot, 2000000), mountpoint, nothreads=False, foreground=True, allow_other=True)
 
 
 if __name__ == '__main__':
