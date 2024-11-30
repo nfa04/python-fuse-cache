@@ -5,6 +5,10 @@ from __future__ import with_statement
 import os
 import sys
 import errno
+import threading
+import time
+import shutil
+import glob
 
 from fuse import FUSE, FuseOSError, Operations, fuse_get_context
 
@@ -25,11 +29,6 @@ class Passthrough(Operations):
     # Filesystem methods
     # ==================
 
-    def access(self, path, mode):
-        full_path = self._full_path(path)
-        if not os.access(full_path, mode):
-            raise FuseOSError(errno.EACCES)
-
     def chmod(self, path, mode):
         full_path = self._full_path(path)
         return os.chmod(full_path, mode)
@@ -46,7 +45,6 @@ class Passthrough(Operations):
 
     def readdir(self, path, fh):
         full_path = self._full_path(path)
-
         dirents = ['.', '..']
         if os.path.isdir(full_path):
             dirents.extend(os.listdir(full_path))
@@ -129,10 +127,77 @@ class Passthrough(Operations):
     def fsync(self, path, fdatasync, fh):
         return self.flush(path, fh)
 
+class CachedPassthrough(Passthrough):
+    def __init__(self, root, fallbackRoot):
+        super().__init__(root)
+        self.root = root
+        self.fallbackRoot = fallbackRoot
+        self.backgroundWorker = threading.Thread(target = self.sync_to_fallback)
+        self.backgroundWorker.deamon = True
+        self.backgroundWorker.start()
+        self.lastSync = 0
+    
+    def _full_path_gen(self, root, partial):
+        if partial.startswith("/"):
+            partial = partial[1:]
+        path = os.path.join(root, partial)
+        return path
 
-def main(mountpoint, root):
-    FUSE(Passthrough(root), mountpoint, nothreads=True, foreground=True, allow_other=True)
+
+    def readdir(self, path, fh):
+        full_path = self._full_path_gen(self.fallbackRoot, path)
+        dirents = ['.', '..']
+        if os.path.isdir(full_path):
+            dirents.extend(list(set(os.listdir(full_path) + os.listdir(self._full_path_gen(self.fallbackRoot, path)))))
+        for r in dirents:
+            yield r
+
+    def access(self, path, mode):
+        full_path = self._full_path(path)
+        if not os.access(full_path, mode):
+            if not os.access(self._full_path_gen(self.fallbackRoot, path), mode):
+                raise FuseOSError(errno.EACCES)
+
+    def open(self, path, flags):
+        if not "gooutput" in path:
+            full_path = self._full_path_gen(self.root, path)
+            fallbackPath = self._full_path_gen(self.fallbackRoot, path)
+            if not os.path.exists(full_path):
+                shutil.copyfile(fallbackPath, full_path)
+        return super().open(path, flags)
+
+    def getattr(self, path, fh=None):
+        full_path = self._full_path_gen(self.root, path)
+        if os.path.exists(full_path):
+            st = os.lstat(full_path)
+            return dict((key, getattr(st, key)) for key in ('st_atime', 'st_ctime',
+                        'st_gid', 'st_mode', 'st_mtime', 'st_nlink', 'st_size', 'st_uid'))
+        st = os.lstat(self._full_path_gen(self.fallbackRoot, path))
+        return dict((key, getattr(st, key)) for key in ('st_atime', 'st_ctime',
+                'st_gid', 'st_mode', 'st_mtime', 'st_nlink', 'st_size', 'st_uid'))
+
+    def sync_to_fallback(self):
+        # Initial timeout
+        #time.sleep(5)
+        while True:
+            time.sleep(1)
+            list_of_files = glob.glob(self.root + "/*") # * means all if need specific format then *.csv
+            for file in list_of_files:
+                if os.path.getctime(file) > self.lastSync:
+                    file_stripped_path = file[len(self.root):]
+                    fallbackPath = self._full_path_gen(self.fallbackRoot, file_stripped_path)
+                    if not os.path.exists(fallbackPath) or os.path.getctime(file) > os.path.getctime(fallbackPath):
+                        if os.path.exists(fallbackPath):
+                            os.remove(fallbackPath)
+                        shutil.copyfile(file, fallbackPath)
+                        print("file synced: " + file_stripped_path)
+                        time.sleep(1)
+            
+            
+
+def main(mountpoint, root, fallbackRoot):
+    FUSE(CachedPassthrough(root, fallbackRoot), mountpoint, nothreads=False, foreground=True, allow_other=True)
 
 
 if __name__ == '__main__':
-    main(sys.argv[2], sys.argv[1])
+    main(sys.argv[3], sys.argv[1], sys.argv[2])
