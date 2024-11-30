@@ -1,9 +1,6 @@
-# python-fuse-sample
+# Fuse Cache
 
-This repo contains a very simple FUSE filesystem example in Python. It's the
-code from a post I wrote a while back:
+Fuse Cache is a simple FUSE filesystem for caching files from a remote filesystem on a local filesystem for faster access while always remaining in sync. It also features a queue to reduce strain on upload bandwith.
 
-https://www.stavros.io/posts/python-fuse-filesystem/
-
-If you see anything needing improvement or have any feedback, please open an
-issue.
+## Credits
+Credits to Stavros Korokithakis (@skorokithakis) for the base passthrough sample which I extended. See: https://github.com/skorokithakis/python-fuse-sample
